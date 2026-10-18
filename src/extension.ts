@@ -4,12 +4,12 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import net from 'net';
 import { createRequire } from 'node:module';
-import { Message, PcoAddon } from './types.js';
+import { Message, PcoAddon, Range, Diff, Line } from './types.js';
 import { insertIntoActiveBuffer } from './utils.js'
 
 const require = createRequire(import.meta.url);
 
-const libpco = require('../build/libpcojs.node');
+const libpco = require('../build/libpcojs.node') as PcoAddon;
 
 
 interface ServerConfig {
@@ -37,6 +37,7 @@ export function getConnectionConfig(): ConnectionConfig | undefined {
 async function configureConnection(
     context: vscode.ExtensionContext
 ): Promise<void> {
+	console.log("pco extension activated");
 
     // Step 1: Ask the user to choose a mode.
     const selectedMode = await vscode.window.showQuickPick(
@@ -72,7 +73,7 @@ async function configureConnection(
             title: 'Server Configuration',
             prompt: 'Enter the port number to bind the server socket to',
             placeHolder: 'e.g. 5000',
-            value: '5000',
+            value: '8080',
             validateInput: (value) => {
                 const port = Number(value);
 
@@ -105,6 +106,7 @@ async function configureConnection(
             title: 'Client Configuration',
             prompt: 'Enter the server IP address or hostname',
             placeHolder: 'e.g. 192.168.1.100',
+			value: '192.168.29.126',
             validateInput: (value) => {
                 if (!value.trim()) {
                     return 'Server address cannot be empty.';
@@ -122,8 +124,8 @@ async function configureConnection(
         const portInput = await vscode.window.showInputBox({
             title: 'Client Configuration',
             prompt: 'Enter the port on which the server is listening',
-            placeHolder: 'e.g. 5000',
-            value: '5000',
+            placeHolder: 'e.g. 8080',
+            value: '8080',
             validateInput: (value) => {
                 const port = Number(value);
 
@@ -167,11 +169,6 @@ export async function activate(
     context: vscode.ExtensionContext
 ): Promise<void> {
 
-
-    // Ask the user to configure the extension on activation.
-    
-	
-
     const disposable = vscode.commands.registerCommand(
         'pco-vs-code.pco',
          async () => {
@@ -181,15 +178,15 @@ export async function activate(
 
 			let sock;
 			if (connectionConfig?.mode === 'client') {
-				sock = libpco.client_connect(connectionConfig.serverAddress, connectionConfig.port);
-				sock.client_hello();
+				sock = libpco.clientConnect(connectionConfig.serverAddress, connectionConfig.port);
+				sock.clientHello();
 			} else if (connectionConfig?.mode === 'server') {
-				sock = libpco.server_start(connectionConfig.port);
+				sock = libpco.serverStart('temp-change-it', connectionConfig.port);
 			} else {
 				return;
 			}
 
-			const PIPE_READ_FD = sock.get_pipe_fd();
+			const PIPE_READ_FD = sock.getPipeFd();
 
 			// Create a socket wrapped around the existing file descriptor
 			const pipeReadStream = new net.Socket({
@@ -200,10 +197,9 @@ export async function activate(
 
 			pipeReadStream.on('data', (chunk) => {
 				console.log(`Data in queue available to read... Inserting to active editor`);
-				insertIntoActiveBuffer(sock.get_message());
+				insertIntoActiveBuffer(sock.getMessage());
 			});
 
-			
 			pipeReadStream.on('end', () => {
 				console.log('Pipe read end closed by the writer.');
 			});
@@ -211,6 +207,60 @@ export async function activate(
 			pipeReadStream.on('error', (err) => {
 				console.error('Pipe error:', err);
 			});
+
+			let changeDisposable = vscode.workspace.onDidChangeTextDocument((event) => {
+				const editor = vscode.window.activeTextEditor;
+				
+				
+				for (const change of event.contentChanges) {
+					const isAdd = change.range.isEmpty && change.text.length > 0;
+					const isDelete = !change.range.isEmpty && change.text.length === 0;
+					const isReplace = !change.range.isEmpty && change.text.length > 0;
+
+					let changeType = 'unknown';
+					if (isAdd) changeType = 'DIFF_ADDED';
+					else if (isDelete) changeType = 'DIFF_DELETED';
+					else if (isReplace) changeType = 'DIFF_MODIFIED';
+
+					const range: Range = {
+						start_pos: change.range.start.line,
+						start_char: change.range.start.character,
+						end_pos: change.range.end.line,
+						end_char: change.range.end.character
+					}
+					const line: Line = {
+						body: change.text,
+						len: change.text.length,
+					}
+					
+					let lines: Array<Line> = [line]
+
+					if (editor && editor.document === event.document) {
+						const cursorPosition: vscode.Position = editor.selection.active;
+
+						const diff: Diff[] = [{
+							cursor_position: cursorPosition.line,
+							kind: changeType,
+							range: range,
+							path: event.document.uri.path,
+							plen: event.document.uri.path.length,
+							llen: lines.length,
+							lines: lines
+						}]
+						const msg: Message = {
+							kind: "MSG_CONTENT",
+							dlen: 1,
+							diff: diff
+						}
+						
+						console.log(msg);
+						sock.sendMessage(msg)
+					}
+				}
+
+				
+			});
+			context.subscriptions.push(changeDisposable);
         }
     );
 
